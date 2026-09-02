@@ -1,0 +1,4 @@
+wrangler.toml
+README.md
+.wrangler/cache/wrangler-account.json
+upload/

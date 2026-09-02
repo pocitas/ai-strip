@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flight strip autofill — proof of concept</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism.min.css">
+<style>
+  body {
+    max-width: 700px;
+    margin: 2rem auto;
+    padding: 0 1rem;
+    font-family: sans-serif;
+    line-height: 1.4;
+  }
+  textarea, input {
+    width: 100%;
+    font-family: monospace;
+    font-size: 1rem;
+    padding: .4rem;
+  }
+  label {
+    display: block;
+    margin-top: .8rem;
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0 1rem;
+  }
+  .full {
+    grid-column: 1 / -1;
+  }
+  .status.err {
+    color: red;
+  }
+  pre {
+    overflow-x: auto;
+  }
+</style>
+</head>
+<body>
+<h1>AI strip</h1>
+<p>Automatické vyplnění stripu za pomoci jazykového modelu.</p>
+
+<h2>1. Zadání</h2>
+<input type="text" id="inputText" placeholder="např. 'ais do kv 2os pic Šmaha' nebo 'wia z lt do be chce na 09'">
+<p>
+  <button id="autofillBtn">Vyplnit</button>
+  <span id="status" class="status"></span>
+</p>
+
+<h2>2. Flight strip</h2>
+<form id="stripForm" autocomplete="off">
+  <div class="grid">
+    <label for="f_registration">Registration
+      <input type="text" id="f_registration" name="registration">
+    </label>
+    <label for="f_type">Aircraft type
+      <input type="text" id="f_type" name="aircraft_type">
+    </label>
+    <label for="f_dep">Routing — DEP
+      <input type="text" id="f_dep" name="dep">
+    </label>
+    <label for="f_dest">Routing — DEST
+      <input type="text" id="f_dest" name="dest">
+    </label>
+    <label for="f_pic">PIC
+      <input type="text" id="f_pic" name="pic">
+    </label>
+    <label for="f_pob">POB
+      <input type="number" id="f_pob" name="pob" min="0">
+    </label>
+    <label for="f_language">Language (radio comms)
+      <input type="text" id="f_language" name="language">
+    </label>
+    <label for="f_notes" class="full">Notes
+      <textarea id="f_notes" name="notes"></textarea>
+    </label>
+  </div>
+</form>
+
+<h2>3. Raw LLM output</h2>
+<pre><code id="jsonOut" class="language-json">—</code></pre>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js"></script>
+<script>
+  const WORKER_URL = "https://fs-autofill.hybner.workers.dev/api/autofill";
+
+  const $ = (id) => document.getElementById(id);
+  const inputText = $("inputText");
+  const autofillBtn = $("autofillBtn");
+  const statusEl = $("status");
+  const jsonOut = $("jsonOut");
+
+  const FIELDS = ["registration", "aircraft_type", "dep", "dest", "pic", "pob", "language", "notes"];
+
+  function setStatus(msg, isError) {
+    statusEl.textContent = msg || "";
+    statusEl.classList.toggle("err", !!isError);
+  }
+
+  function fillForm(data) {
+    for (const key of FIELDS) {
+      const el = $("f_" + (key === "aircraft_type" ? "type" : key));
+      if (!el) continue;
+      const val = data ? data[key] : null;
+      el.value = (val === null || val === undefined) ? "" : val;
+    }
+  }
+
+  function renderJson(value) {
+    jsonOut.textContent = JSON.stringify(value, null, 2);
+    Prism.highlightElement(jsonOut);
+  }
+
+  async function autofill() {
+    const text = inputText.value.trim();
+    if (!text) {
+      setStatus("Type something first.", true);
+      return;
+    }
+
+    autofillBtn.disabled = true;
+    setStatus("Přemýšlím…");
+    jsonOut.textContent = "…";
+
+    try {
+      const res = await fetch(WORKER_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+      const data = await res.json();
+
+      if (!res.ok) {
+        setStatus(data.error || `Request failed (${res.status})`, true);
+        renderJson(data);
+        return;
+      }
+
+      fillForm(data.parsed);
+      renderJson(data.raw ?? data.parsed);
+      setStatus(`Done (model: ${data.model || "unknown"}).`);
+    } catch (err) {
+      setStatus("Network error: " + err.message, true);
+    } finally {
+      autofillBtn.disabled = false;
+    }
+  }
+
+  autofillBtn.addEventListener("click", autofill);
+  inputText.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") autofill();
+  });
+</script>
+</body>
+</html>
