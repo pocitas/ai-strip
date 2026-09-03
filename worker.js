@@ -1,148 +1,120 @@
-// const MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
-// Cheaper/faster alternative (still supports JSON schema mode):
-const MODEL = "@cf/meta/llama-3.1-8b-instruct-fast";
+/**
+ * Flight strip autofill — Cloudflare Worker
+ *
+ * Split of responsibilities:
+ *  - The LLM only extracts RAW field values from messy Czech/English shorthand
+ *    (which token is the registration, which is dep/dest, etc). It does no
+ *    normalization — no hyphen insertion, no ICAO prefixing.
+ *  - aircraft_type is NOT extracted by the LLM at all. It is derived purely
+ *    from the LAA registration-format rule (5-char OK-YTINN suffix -> type
+ *    letter). Any explicit type word in the input (e.g. "ul", "kl") is not
+ *    a recognized field anymore and just falls through to "notes" as
+ *    leftover text, same as any other uncategorized word.
+ *  - All normalization is deterministic and lives below in plain JS, where
+ *    it's testable and can never "forget" a rule the way a small model
+ *    occasionally does under schema-constrained decoding.
+ *
+ * No API key is needed for Workers AI itself — the binding is authenticated
+ * by your Cloudflare account when deployed.
+ */
 
 // ---------------------------------------------------------------------------
-// JSON schema the model must return (OpenAI-compatible json_schema mode)
+// MODEL
+// ---------------------------------------------------------------------------
+
+// const MODEL = "@cf/meta/llama-3.1-8b-instruct-fast";
+// Confirmed json_schema-compatible, cheapest option — current default.
+//
+// If accuracy is still disappointing after the prompt simplification below,
+// the only real step up on the confirmed-compatible list is:
+const MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+// ~6x the per-token cost of the 8B model — at 300 req/day this runs past the
+// 10,000 free daily neurons by roughly 3,000, which costs about $0.03–0.05/day
+// on Workers Paid. Worth it only if 8B keeps failing after the JS refactor;
+// not a "nearly free" default swap.
+
+// ---------------------------------------------------------------------------
+// JSON schema the model must return — RAW fields only, no normalization,
+// no aircraft_type (that's derived from the registration in JS, below).
 // ---------------------------------------------------------------------------
 
 const FLIGHT_STRIP_SCHEMA = {
   type: "object",
   properties: {
-    registration: { type: ["string", "null"], description: "Full aircraft registration, e.g. OK-AIM" },
-    aircraft_type: { type: ["string", "null"], description: "Aircraft type / category, e.g. ultralight, C172" },
-    dep: { type: ["string", "null"], description: "Departure aerodrome (ICAO if resolvable) or cardinal direction or raw text" },
-    dest: { type: ["string", "null"], description: "Destination aerodrome (ICAO if resolvable) or cardinal direction or raw text" },
+    registration: { type: ["string", "null"], description: "Registration token exactly as typed in the input, e.g. ais, GUU02, d-ereu" },
+    dep: { type: ["string", "null"], description: "Departure location exactly as typed — code, direction word, or place name, unmodified" },
+    dest: { type: ["string", "null"], description: "Destination location exactly as typed — code, direction word, or place name, unmodified" },
     pic: { type: ["string", "null"], description: "Pilot in command's name, single word" },
     pob: { type: ["integer", "null"], description: "Persons on board" },
-    language: { type: ["string", "null"], description: "Radio/communication language, if explicitly stated" },
-		notes: { type: ["string", "null"], description: "Additional operational notes or comments" },
+    language: { type: ["string", "null"], description: "Radio/communication language, only if explicitly stated" },
+    notes: { type: ["string", "null"], description: "Any leftover or explicitly flagged operational notes" },
   },
-  required: ["registration", "aircraft_type", "dep", "dest", "pic", "pob", "language", "notes"],
+  required: ["registration", "dep", "dest", "pic", "pob", "language", "notes"],
   additionalProperties: false,
 };
 
 // ---------------------------------------------------------------------------
-// Prompt construction
+// Prompt — only the parts that genuinely need language understanding.
+// Everything algorithmic (hyphens, ICAO prefixes, type-from-registration)
+// has been moved to the normalizeXxx() functions below.
 // ---------------------------------------------------------------------------
 
 const SYSTEM_PROMPT = `You are a flight-strip data extraction assistant for a small Czech airfield.
-Convert short, terse operational notes into a structured JSON. Notes may be in Czech,
-English, or a mix of both, are heavily abbreviated, fields may appear in any order,
-and any field may be missing. Split the note into individual words and pairs.
-Words are separated by spaces or commas only. Example: "word1 wo-rd-2,word3".
-A same word or pair should not be used for multiple fields.
+Extract RAW field values from a short, informal flight-ops note. Notes may be in
+Czech, English, or a mix, heavily abbreviated, in any word order, with fields
+possibly missing.
+
+IMPORTANT: return every value EXACTLY as it appears in the input. Do not add
+prefixes, insert hyphens, expand airport codes, or infer anything not directly
+stated. Normalization happens outside this step.
+
+Aircraft type is NOT a field you extract — it is derived elsewhere from the
+registration. Do not try to identify or output an aircraft type; if the input
+contains a word that looks like a type abbreviation (e.g. "ul", "kl", "gl",
+"vrt"), treat it like any other word that doesn't fit a recognized field (see
+NOTES below).
 
 REGISTRATION
-Return in uppercase. Usually the first or second word of the input. Always has minimum of 3 characters.
-If the word is 3 lettters only, add "OK-" as a prefix. Example: "abc" -> "OK-ABC"
-else
-If the word is 4 digits only, add "OK-" as a prefix. Example: "1234" -> "OK-1234"
-else
-If the word is exactly 3 letters followed by 2 numbers only, add "OK-" as a prefix. Example: "abc12" -> "OK-ABC12"
+- Always the first word/token of the input, minimum 3 characters.
+- May be preceded by a marker like "r", "reg", "i", "ima" — if so, use the word
+  that follows the marker, not the marker itself.
+- Return exactly as typed (keep original case).
 
-After previous rules are applied, if the output still has no hyphen, add a missing hyphen following these rules:
-
-Pass 1: If the word starts with any of the following character sequences,
-    insert a hyphen after the sequence and skip Pass 2.
-'C2', 'C3', 'C5', 'C6', 'C9', 'CC', 'CN', 'CP', 'CS', 'CU', 'CX',
-'D2', 'D4', 'D6', 'DQ', 'GL', 'MT',
-'P2', 'P4', 'PH', 'PJ', 'PK', 'PP', 'PR', 'PT', 'PZ',
-'Z3', 'ZA', 'ZJ', 'ZK', 'ZL', 'ZP', 'ZS', 'ZT', 'ZU',
-'B', 'C', 'D', 'F', 'G', 'I', 'M', 'P', 'Z', '2'
-
-Examples of Pass 1: "CSSPA" -> "CS-SPA", "DAIZR" -> "D-AIZR", "GEDBA" -> "G-EDBA"
-
-Pass 2: Insert hyphen after the second character if no hyphen has been added in Pass 1.
-Examples of Pass 2: "OMMMI" -> "OM-MMI", "EIKLM" -> "EI-KLM"
-
-AIRCRAFT TYPE
-Expand known abbreviations
-"ul" -> "ultralight",
-"hel" -> "helicopter"
-"gl" -> "glider"
-"ces" -> "Cessna",
-"pip" -> "Piper",
-"tec" -> "Tecnam",
-"twin" -> "twin-engine",
-"vrt" -> "vrtulník",
-"kl" -> "kluzák"
-
-If the registration is exactly in the format "OK-XXXXX", where "X" is any character,
-use the fifth character to infer the type using the following mapping:
-    "U" = ultralight,
-		"K" = ultralight glider,
-		"W" = autogyro,
-		"H" = ultralight helicopter,
-		"Z" = motorized hang glider,
-		"M" = motorized paraglider,
-		"R" = hang glider,
-		"B" = ultralight baloon
-
-Example: "OK-PUA79" -> "ultralight", "OK-KWA33" -> "autogyro"
-
-ROUTING
-- Departure cues: "from", "orig", "z", "ze", "od". Also "from X" means the flight is
-  arriving FROM X, so X is the departure aerodrome (dep), not the destination.
-- Do not mistake with "dep south", "dep north", "dep east", "dep west", "dep straight", and similar phrases..
-  This indicates the aircraft is departing towards the south, west, etc., not that the departure aerodrome
-	is named "south". So any "dep" keyword followed by other than 2 or 4 characters should be considered as "dest" field.
-	Any other strings, which follow the departure cues but do not look like an ICAO or IATA airport code
-	just extract the word as is. (e.g. "from Zlonice" -> "Zlonice", "z J" -> "J")
-- Destination cues: "to", "dest", "do", "heading". Also "to X" (departing to X) means the flight is departing towards X.
-  So X is the destination aerodrome. 
-  Examples: "heading south", "na jih", "to south", "direction south" all means the flight is heading
-  towards the south. Cardinal directions can be represented by their first letter
-	(e.g. "S" for "south", "N" for "north", "E" for "east", "W" for "west", "J" for "jih", "Z" for "západ", "V" for "východ").
-	If it is represented by a single letter only, keep it as is and treat is as the destination field.
-- In case the airport code of departure or destination is given with exactly two letters,
-  prepend the missing czech prefix "LK" to form the full ICAO code. For example, "SN" becomes "LKSN", "LT" becomes "LKLT".
-- If a routing endpoint is only a vague word (e.g. "east", "sever", "Zlonice") and no aerodrome/code is
-  given, put that word in the field as plain text.
-- Transition cues: "trans", "transition", "průlet", "pru". It means the aircraft just transits the airspace.
-  It doesn't indicate any special flag for the strip, but expect two points, either entry / exit points
-	(e.g. "W to E" -> dep = "W", dest = "E") or departure and destination aerodromes.
-	example: "LT to TA" means dep = "LKLT", dest = "LKTA" (see adding the "LK" prefix rule mentioned above).
-- The input can contain both dep and dest at the same time. If there is no dep cue, assume the first location mentioned
-  is the departure point. (e.g. "TA do BE" -> dep = "LKTA", dest = "LKBE") or (e.g. "VL to EDMC" -> dep = "LKVL", dest = "EDMC")
-- If both departure and destination points / airports are mentioned, these could be connected by a hyphen only
-  (e.g. "LT-BE" -> dep = "LKLT", dest = "LKBE").
-- Distinguish "z XX" (two letters) as indicating departure from a location (e.g. "z PR" -> dep = "LKPR")
-  compared to "na Z" indicates the cardinal direction západ (e.g. "na Z" -> dest = "Z")
-
+ROUTING (dep / dest)
+- dep = where the flight is coming FROM. Cues: "from", "orig", "z", "ze", "od",
+  "arr from X" (X is dep).
+- dest = where the flight is going TO. Cues: "to", "dest", "do", "heading", "na"
+  — EXCEPT "na" followed directly by a 2-digit number (e.g. "na 09") is a
+  runway note, not a destination; put "na 09" in notes instead.
+- If two locations are given with no dep cue on either, the first mentioned is
+  dep and the second is dest.
+- Return the location token exactly as typed.
 
 PERSONS ON BOARD (pob)
-Cues: "pob", "p" (e.g. "pob 2"), a number directly followed or preceded by "p", "o", "os" or "osob" (Czech for
-"persons") (e.g. "2p", "2 p", "2 o","2os", "pob 2"," os 2"). "solo" / "sólo" / "sám" means pob = 1.
-Distinguish "p number" / "number p" (Persons on board = pob) compared to "p Name" (Pilot in command = pic).
-(e.g. "p 2" -> pob = 2, "p John" -> pic = "John")
+- Cues: "pob", "p", "o", "os", "osob" attached to or near a number.
+  "solo" / "sám" means pob = 1.
+- Must end up as an integer.
 
 PILOT IN COMMAND (pic)
-Cues: "pic", "pilot", "velitel", "vel", "v", "p" followed by a name. The pilot name is always a single word.
-Distinguish "v Name" (velitel / pilot in command) compared to "to v" (indicating direction východ / east).
-(e.g. "pic Poc", "pilot Smith", "velitel Burda"). Treat any other words as a different field or "notes".
-(e.g. "pic Liu solo" -> "pic" = "Liu", "pob" = 1)
-(e.g. "vel Noh za 2 hodiny" -> "pic" = "Noh", "notes" = "za 2 hodiny")
-
+- Always a single word (a name). Cues: "pic", "pilot", "velitel", "vel", "v",
+  "p" immediately followed by a name-looking word.
 
 LANGUAGE
-Only set this if the note explicitly names a language, e.g.
-"eng" / "en" / "an" -> "english", otherwise null. This must be a separate word, not part of another word.
-(e.g. "end" means registration "OK-END" without prefix, not the language "english" just because it contains "en").
+- Only set if a radio/communication language is explicitly named:
+  "eng"/"en" -> "english". Never guess.
 
 NOTES
-Can include any additional operational notes or comments relevant to the flight.
-Can be recognized with "poz", "pozn", "note", "desc", followed by the actual note text.
-Any uncategorized (unrecognized as a specific field) text at the end of the input can be treated as notes.
+- Cues: "poz", "pozn", "note", "desc" followed by the note text.
+- Also: any leftover text that doesn't fit another field (including apparent
+  aircraft-type words — see above), and any runway/heading numbers mentioned
+  after "na" (see ROUTING exception above).
 
 GENERAL RULES
-- Never invent data. If a field is not stated and cannot be reasonably inferred from the
-  cues above, output null for it.
-- pob must be an integer or null, never a string.
-- Output must strictly match the provided JSON schema — no extra commentary.`;
+- Never invent data. Use null for anything not stated or clearly indicated by
+  the cues above.
+- pob is an integer or null, never a string.
+- Output must strictly match the JSON schema — no extra commentary.`;
 
-// Few-shot examples (kept consistent with the rules above; see worker.js header
-// comment if you want to add more as you refine real club usage).
 const FEW_SHOT = [
   {
     role: "user",
@@ -151,14 +123,8 @@ const FEW_SHOT = [
   {
     role: "assistant",
     content: JSON.stringify({
-      registration: "OK-GUU02",
-      aircraft_type: "ultralight",
-      dep: "LKSN",
-      dest: null,
-      pic: null,
-      pob: null,
-      language: null,
-      notes: null,
+      registration: "GUU02", dep: "SN", dest: null,
+      pic: null, pob: null, language: null, notes: "ul",
     }),
   },
   {
@@ -168,17 +134,10 @@ const FEW_SHOT = [
   {
     role: "assistant",
     content: JSON.stringify({
-      registration: "OK-UTC",
-      aircraft_type: null,
-      dep: null,
-      dest: "LKTB",
-      pic: null,
-      pob: 2,
-      language: null,
-      notes: "bez návratu",
+      registration: "UTC", dep: null, dest: "LKTB",
+      pic: null, pob: 2, language: null, notes: "bez návratu",
     }),
   },
-	
   {
     role: "user",
     content: "IUU20 dep sever pic Karel solo",
@@ -186,14 +145,8 @@ const FEW_SHOT = [
   {
     role: "assistant",
     content: JSON.stringify({
-      registration: "OK-IUU20",
-      aircraft_type: "ultralight",
-      dep: null,
-      dest: "sever",
-      pic: "Karel",
-      pob: 1,
-      language: null,
-      notes: null,
+      registration: "IUU20", dep: null, dest: "sever",
+      pic: "Karel", pob: 1, language: null, notes: null,
     }),
   },
   {
@@ -203,83 +156,64 @@ const FEW_SHOT = [
   {
     role: "assistant",
     content: JSON.stringify({
-      registration: "OK-IFR",
-      aircraft_type: null,
-      dep: "LKKV",
-      dest: null,
-      pic: null,
-      pob: 1,
-      language: "english",
-      notes: "student",
+      registration: "IFR", dep: "KV", dest: null,
+      pic: null, pob: 1, language: "english", notes: "student",
     }),
   },
   {
     role: "user",
-    content: "kl 1082 eng ze ZB solo vel Rammert na 09",
+    content: "1082 eng kl ze ZB solo vel Rammert na 09",
   },
   {
     role: "assistant",
     content: JSON.stringify({
-      registration: "OK-1082",
-      aircraft_type: "glider",
-      dep: "LKZB",
-      dest: null,
-      pic: "Rammert",
-      pob: 1,
-      language: "english",
-      notes: "na 09",
+      registration: "1082", dep: "ZB", dest: null,
+      pic: "Rammert", pob: 1, language: "english", notes: "kl na 09",
     }),
   },
-	{
+  {
     role: "user",
     content: "dereu low fuel kt do mt eng pic Omg, os 2",
   },
   {
     role: "assistant",
     content: JSON.stringify({
-      registration: "D-EREU",
-      aircraft_type: null,
-      dep: "LKKT",
-      dest: "LKMT",
-      pic: "Omg",
-      pob: 2,
-      language: "english",
-      notes: "low fuel",
+      registration: "dereu", dep: "kt", dest: "mt",
+      pic: "Omg", pob: 2, language: "english", notes: "low fuel",
     }),
   },
-	{
+  {
     role: "user",
     content: "wia z lt do be chce na 09",
   },
   {
     role: "assistant",
     content: JSON.stringify({
-      registration: "OK-WIA",
-      aircraft_type: null,
-      dep: "LKLT",
-      dest: "LKBE",
-      pic: null,
-      pob: null,
-      language: null,
-      notes: "chce na 09",
+      registration: "wia", dep: "lt", dest: "be",
+      pic: null, pob: null, language: null, notes: "chce na 09",
     }),
   },
-	
-	{
+  {
     role: "user",
     content: "xwa11 odlet na z os2",
   },
   {
     role: "assistant",
     content: JSON.stringify({
-      registration: "OK-XWA11",
-      aircraft_type: "autogyro",
-      dep: null,
-      dest: "z",
-      pic: null,
-      pob: 2,
-      language: null,
-      notes: "odlet",
+      registration: "xwa11", dep: null, dest: "z",
+      pic: null, pob: 2, language: null, notes: "odlet",
+    }),
+  },
+  {
+    // The failure case that prompted the earlier refactor.
+    role: "user",
+    content: "ais do kv pic Šmerda",
+  },
+  {
+    role: "assistant",
+    content: JSON.stringify({
+      registration: "ais", dep: null, dest: "kv",
+      pic: "Šmerda", pob: null, language: null, notes: null,
     }),
   },
 ];
@@ -290,6 +224,101 @@ function buildMessages(userText) {
     ...FEW_SHOT,
     { role: "user", content: userText },
   ];
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic normalization — everything that used to be prose instructions
+// is now plain JS, ported 1:1 from the rules you specified.
+// ---------------------------------------------------------------------------
+
+// Pass A prefixes for missing-hyphen insertion, longest match first so e.g.
+// "CSSPA" matches "CS" (2 chars) rather than falling through to "C" (1 char).
+const HYPHEN_PREFIXES = [
+  "C2", "C3", "C5", "C6", "C9", "CC", "CN", "CP", "CS", "CU", "CX",
+  "D2", "D4", "D6", "DQ", "GL", "MT",
+  "P2", "P4", "PH", "PJ", "PK", "PP", "PR", "PT", "PZ",
+  "Z3", "ZA", "ZJ", "ZK", "ZL", "ZP", "ZS", "ZT", "ZU",
+  "B", "C", "D", "F", "G", "I", "M", "P", "Z", "2",
+].sort((a, b) => b.length - a.length);
+
+function insertMissingHyphen(upper) {
+  for (const prefix of HYPHEN_PREFIXES) {
+    if (upper.startsWith(prefix)) {
+      return upper.slice(0, prefix.length) + "-" + upper.slice(prefix.length);
+    }
+  }
+  // Pass B fallback: hyphen after the first two characters.
+  return upper.slice(0, 2) + "-" + upper.slice(2);
+}
+
+function normalizeRegistration(raw) {
+  if (!raw) return null;
+  const upper = String(raw).trim().toUpperCase();
+  if (!upper) return null;
+
+  if (upper.includes("-")) return upper; // already a full/foreign registration
+
+  if (/^[A-Z]{3}$/.test(upper)) return "OK-" + upper;
+  if (/^[0-9]+$/.test(upper)) return "OK-" + upper; // digits-only, any length
+  if (/^[A-Z]{3}[0-9]{2}$/.test(upper)) return "OK-" + upper;
+
+  return insertMissingHyphen(upper);
+}
+
+const CZECH_AIRPORT_CODES = new Set([
+  "be", "bo", "tb", "br", "ba", "bu", "ce", "cs", "dk", "er", "fr", "hb", "hd", "hc", "hv", "hs", "hk", "hn",
+  "cb", "ch", "ct", "cr", "ja", "jc", "ji", "jh", "kv", "kl", "kt", "ko", "kr", "km", "ka", "ku", "ky", "pl",
+  "lt", "lb", "lu", "mr", "cm", "mi", "mb", "mh", "mk", "mo", "nm", "ol", "mt", "pc", "pd", "ps", "ln", "pn",
+  "pa", "pr", "vo", "pj", "po", "pm", "pi", "rk", "ra", "ry", "ro", "sz", "sk", "sn", "so", "sa", "sb", "st",
+  "sr", "su", "ta", "td", "tc", "to", "ul", "uo", "vp", "vl", "vr", "vm", "vy", "za", "zb", "zl", "zn", "zm",
+  "zd",
+]);
+
+function normalizeLocation(raw) {
+  if (!raw) return null;
+  const trimmed = String(raw).trim();
+  const lower = trimmed.toLowerCase();
+
+  if (/^[a-z]{2}$/.test(lower) && CZECH_AIRPORT_CODES.has(lower)) {
+    return "LK" + lower.toUpperCase();
+  }
+  if (/^[a-z]{4}$/i.test(trimmed)) {
+    return trimmed.toUpperCase(); // looks like a bare ICAO code already
+  }
+  return trimmed; // direction word, place name, single-letter direction, etc.
+}
+
+const LAA_TYPE_MAP = {
+  U: "ultralight",
+  K: "ultralight glider",
+  W: "autogyro",
+  H: "ultralight helicopter",
+  Z: "motorized hang glider",
+  M: "motorized paraglider",
+  R: "hang glider",
+  B: "ultralight balloon",
+};
+
+// The ONLY source of aircraft_type. No LLM input involved.
+function inferAircraftTypeFromRegistration(registration) {
+  if (!registration) return null;
+  const m = /^OK-([A-Z0-9]{5})$/.exec(registration);
+  if (!m) return null;
+  return LAA_TYPE_MAP[m[1][1]] || null; // 2nd char of the 5-char suffix = type letter
+}
+
+function normalizeResult(raw) {
+  const registration = normalizeRegistration(raw.registration);
+  return {
+    registration,
+    aircraft_type: inferAircraftTypeFromRegistration(registration),
+    dep: normalizeLocation(raw.dep),
+    dest: normalizeLocation(raw.dest),
+    pic: raw.pic ?? null,
+    pob: typeof raw.pob === "number" ? raw.pob : null,
+    language: raw.language ?? null,
+    notes: raw.notes ?? null,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -306,7 +335,6 @@ function json(data, status, extraHeaders) {
 export default {
   async fetch(request, env) {
     const corsHeaders = {
-      // Demo default — restrict to your Pages origin before sharing this publicly.
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "POST, OPTIONS",
       "Access-Control-Allow-Headers": "Content-Type",
@@ -336,21 +364,16 @@ export default {
       const result = await env.AI.run(MODEL, {
         messages: buildMessages(text),
         response_format: { type: "json_schema", json_schema: FLIGHT_STRIP_SCHEMA },
-        max_tokens: 400,
+        max_tokens: 300,
         temperature: 0,
       });
 
-      // On success, Workers AI JSON-schema mode returns { response: {...} }.
-      const parsed = result && typeof result === "object" ? result.response : null;
-
-      if (!parsed) {
-        return json(
-          { error: "Model did not return schema-conformant JSON", raw: result },
-          502,
-          corsHeaders
-        );
+      const rawParsed = result && typeof result === "object" ? result.response : null;
+      if (!rawParsed) {
+        return json({ error: "Model did not return schema-conformant JSON", raw: result }, 502, corsHeaders);
       }
 
+      const parsed = normalizeResult(rawParsed);
       return json({ parsed, raw: result, model: MODEL }, 200, corsHeaders);
     } catch (err) {
       return json({ error: "AI request failed", detail: String(err && err.message ? err.message : err) }, 502, corsHeaders);
